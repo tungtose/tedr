@@ -1,0 +1,44 @@
+[package]
+name = "tedr"
+version = "0.0.1"
+edition = "2024"
+
+[package.metadata.wdk.driver-model]
+driver-type = "WDM"
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+
+[features]
+default = []
+nightly = ["wdk/nightly", "wdk-sys/nightly"]
+
+[dependencies]
+wdk = { path = "../../windows-drivers-rs/crates/wdk" }
+wdk-alloc = { path = "../../windows-drivers-rs/crates/wdk-alloc" }
+wdk-sys = { path = "../../windows-drivers-rs/crates/wdk-sys", features = ["filesystem"] }
+wdk-panic = { path = "../../windows-drivers-rs/crates/wdk-panic" }
+
+
+# wdk-alloc = "0.3"
+# wdk-sys = "0.4"
+# wdk-panic = "0.3"
+
+serde_json = {version = "1", default-features = false, features = ["alloc"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"]}
+strum = { version = "0.27", default-features = false, features = ["derive"] }
+anyhow = { version = "1", default-features = false }
+
+
+[profile.dev]
+panic = "abort"
+lto = true
+
+[profile.release]
+panic = "abort"
+lto = true
+
+[build-dependencies]
+wdk-build = { path = "../../windows-drivers-rs/crates/wdk-build" }
+# wdk-build = "0.4.0"
