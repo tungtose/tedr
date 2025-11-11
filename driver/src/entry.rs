@@ -12,19 +12,14 @@ use wdk_sys::{
     },
     DRIVER_OBJECT, FLT_PORT_ALL_ACCESS, FLT_REGISTRATION, FLT_REGISTRATION_VERSION, HANDLE,
     LARGE_INTEGER, NTSTATUS, NT_SUCCESS, OBJECT_ATTRIBUTES, OBJ_CASE_INSENSITIVE,
-    OBJ_KERNEL_HANDLE, PCLIENT_ID, PCUNICODE_STRING, PFLT_FILTER, PFLT_PORT, PHANDLE,
-    PSECURITY_DESCRIPTOR, PVOID, STATUS_FAIL_CHECK, STATUS_SUCCESS, THREAD_ALL_ACCESS,
-    UNICODE_STRING, USHORT,
+    OBJ_KERNEL_HANDLE, PCLIENT_ID, PCUNICODE_STRING, PFLT_FILTER, PFLT_PORT, PSECURITY_DESCRIPTOR,
+    PVOID, STATUS_FAIL_CHECK, STATUS_SUCCESS, THREAD_ALL_ACCESS, UNICODE_STRING, USHORT,
     _MODE::KernelMode,
 };
 
 use alloc::{ffi::CString, slice, string::String, vec::Vec};
 
-// TODO: make this atomic
-static mut GLOBAL_MINIFILTER_HANDLE: Option<PFLT_FILTER> = None;
-static mut GLOBAL_MINIFILTER_PORT: Option<PFLT_PORT> = None;
-static mut GLOBAL_CLIENT_PORT: Option<PFLT_PORT> = None;
-static mut GLOBAL_THREAD_WORKER_HANDLE: Option<HANDLE> = None;
+use crate::global;
 
 /// `driver_entry` function required by WDM
 ///
@@ -58,17 +53,16 @@ pub unsafe extern "system" fn driver_entry(
     });
     println!("WDM Driver Entry Complete! Driver Registry Parameter Key: {registry_path}");
 
-    println!("DBG 1");
+    println!("[Entry] Init Global state");
+
     let mut flt_registration: FLT_REGISTRATION = FLT_REGISTRATION::default();
     flt_registration.Size = core::mem::size_of::<FLT_REGISTRATION>() as USHORT;
     flt_registration.Version = FLT_REGISTRATION_VERSION as USHORT; // Version
     flt_registration.Flags = 0;
     flt_registration.FilterUnloadCallback = Some(filter_unload_callback);
 
-    println!("DBG 2");
     let mut global_filter_handle: PFLT_FILTER = unsafe { core::mem::zeroed() };
 
-    println!("DBG 3");
     let mut status =
         unsafe { FltRegisterFilter(driver, &flt_registration, &mut global_filter_handle) };
 
@@ -77,7 +71,7 @@ pub unsafe extern "system" fn driver_entry(
     if NT_SUCCESS(status) {
         println!("Register minifilter success!");
         unsafe {
-            GLOBAL_MINIFILTER_HANDLE = Some(global_filter_handle);
+            global::set_filter_handle(global_filter_handle);
             println!("Saved minifilter handle");
 
             status = FltStartFiltering(global_filter_handle);
@@ -86,7 +80,7 @@ pub unsafe extern "system" fn driver_entry(
                 println!("Failed to start minifilter");
                 FltUnregisterFilter(global_filter_handle);
 
-                GLOBAL_MINIFILTER_HANDLE = None;
+                global::set_filter_handle(ptr::null_mut());
                 driver.DriverUnload = Some(driver_exit);
 
                 return STATUS_SUCCESS;
@@ -130,7 +124,7 @@ pub unsafe extern "system" fn driver_entry(
             if !NT_SUCCESS(status) {
                 println!("ERROR: Failed to spawning kernel thread: PsCreateSystemThread, status: {status}");
             } else {
-                GLOBAL_THREAD_WORKER_HANDLE = Some(p_thread_handle);
+                global::set_thread_worker_handle(p_thread_handle);
                 // TODO: use ObReferenceObjectByHandle to a pointer to thread object.
                 // So we can implement properly shutdown whith ObDereferenceObject
             }
@@ -158,13 +152,19 @@ unsafe extern "C" fn init_comm() -> NTSTATUS {
     println!("[COM] FltBuildDefaultSecurityDescriptor: {status}");
 
     if !NT_SUCCESS(status) {
-        println!("FltBuildDefaultSecurityDescriptor failed.status: {status}");
+        println!("[COM] FltBuildDefaultSecurityDescriptor failed.status: {status}");
         return STATUS_FAIL_CHECK;
     }
 
     if NT_SUCCESS(status) {
         let acl = ptr::null_mut();
         status = unsafe { RtlSetDaclSecurityDescriptor(p_sec_desc, 1, acl as _, 0) };
+
+        if NT_SUCCESS(status) {
+            println!("[COM] RtlSetDaclSecurityDescriptor success");
+        } else {
+            println!("[COM] RtlSetDaclSecurityDescriptor failed: {status}");
+        }
     }
 
     println!("[COM] Dbg 2");
@@ -196,7 +196,7 @@ unsafe extern "C" fn init_comm() -> NTSTATUS {
     let m_port: PFLT_PORT = ptr::null_mut();
 
     unsafe {
-        if let Some(filter_handle) = GLOBAL_MINIFILTER_HANDLE {
+        if let Some(filter_handle) = global::get_filter_handle() {
             status = FltCreateCommunicationPort(
                 filter_handle,
                 m_port as _,
@@ -210,7 +210,7 @@ unsafe extern "C" fn init_comm() -> NTSTATUS {
 
             println!("[COM] Dbg 6");
 
-            GLOBAL_MINIFILTER_PORT = Some(m_port);
+            global::set_filter_port(m_port);
 
             FltFreeSecurityDescriptor(p_sec_desc);
 
@@ -229,7 +229,7 @@ unsafe extern "C" fn init_comm() -> NTSTATUS {
 
 // Called when user-mode connects
 unsafe extern "C" fn connect_notify(
-    client_port: PFLT_PORT, // Save this!
+    client_port: PFLT_PORT,
     _server_port_cookie: PVOID,
     _connection_context: PVOID,
     _size_of_context: u32,
@@ -238,7 +238,7 @@ unsafe extern "C" fn connect_notify(
     println!("[Driver] Client connected");
 
     // Save client port for sending messages later
-    unsafe { GLOBAL_CLIENT_PORT = Some(client_port) };
+    global::set_client_port(client_port);
 
     // No connection context needed
     unsafe { *connection_port_cookie = ptr::null_mut() }
@@ -250,8 +250,8 @@ unsafe extern "C" fn connect_notify(
 unsafe extern "C" fn disconnect_notify(_connection_cookie: PVOID) {
     println!("[Driver] Client disconnected");
 
-    // Clear client port
-    unsafe { GLOBAL_CLIENT_PORT = None };
+    // TODO: Clear client port
+    // unsafe { GLOBAL_CLIENT_PORT = None };
 }
 
 unsafe extern "C" fn filter_unload_callback(_flags: u32) -> NTSTATUS {
@@ -262,15 +262,33 @@ unsafe extern "C" fn worker_thread(_context: PVOID) {
     println!("[Worker] Thread started");
 
     loop {
+        // Checking exit signal
+        if global::should_worker_exit() {
+            println!("[Worker] exit signal received, terminating thread");
+            break;
+        }
+
         // wait for 5 secs
         let mut interval = LARGE_INTEGER::default();
         // kernel unit: 100ns
         interval.QuadPart = -5 * 10_000_000;
+
         unsafe {
-            let _ = KeDelayExecutionThread(KernelMode as i8, 0, &mut interval);
+            let _ = KeDelayExecutionThread(KernelMode as i8, 1, &mut interval);
+        }
+
+        // Checking exit signal again after wait. Will remove this soon
+        if global::should_worker_exit() {
+            println!("[Worker] exit signal received, terminating thread");
+            break;
         }
 
         // Check if connection is connected
+        if global::get_filter_handle().is_none() || global::get_client_port().is_none() {
+            println!("[Worker] client not connected skip");
+            continue;
+        }
+
         // if unsafe { GLOBAL_CLIENT_PORT.is_none() } {
         //     println!("[Worker] client not connected skip");
         //     continue;
@@ -291,10 +309,10 @@ unsafe extern "C" fn worker_thread(_context: PVOID) {
         // );
 
         println!("[Worker] Sending Hello World");
-        unsafe {
-            if let Some(filter_handle) = GLOBAL_MINIFILTER_HANDLE {
-                if let Some(mut client_port) = GLOBAL_CLIENT_PORT {
-                    let status = FltSendMessage(
+        if let Some(filter_handle) = global::get_filter_handle() {
+            if let Some(mut client_port) = global::get_client_port() {
+                let status = unsafe {
+                    FltSendMessage(
                         filter_handle,
                         &mut client_port,
                         message.as_ptr() as _,
@@ -302,15 +320,15 @@ unsafe extern "C" fn worker_thread(_context: PVOID) {
                         ptr::null_mut(),
                         ptr::null_mut(),
                         ptr::null_mut(),
-                    );
-
-                    if NT_SUCCESS(status) {
-                        println!("[Worker] Message sent successfully");
-                    } else {
-                        println!("[Worker] Failed to send message: {:#x}", status);
-                    }
+                    )
                 };
-            }
+
+                if NT_SUCCESS(status) {
+                    println!("[Worker] Message sent successfully");
+                } else {
+                    println!("[Worker] Failed to send message: {:#x}", status);
+                }
+            };
         }
 
         // TODO: properly exit
@@ -318,6 +336,10 @@ unsafe extern "C" fn worker_thread(_context: PVOID) {
 }
 
 extern "C" fn driver_exit(_driver: *mut DRIVER_OBJECT) {
+    if let Some(filter_handle) = global::get_filter_handle() {
+        unsafe { FltUnregisterFilter(filter_handle) };
+    }
+
     println!("Goodbye World!");
     println!("Driver Exit Complete!");
 }

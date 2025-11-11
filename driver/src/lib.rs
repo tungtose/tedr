@@ -11,3 +11,4 @@ use wdk_alloc::WdkAllocator;
 static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 
 mod entry;
+mod global;
