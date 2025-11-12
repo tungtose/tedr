@@ -23,25 +23,25 @@ if ($service) {
         Stop-Service -Name $ServiceName -Force
         Start-Sleep -Seconds 3
     }
-    
+
     # Copy new binary
     Write-Host "Copying new binary..." -ForegroundColor Green
     Copy-Item "$ShareFolder\$BinaryName" $ExePath -Force
-    
+
     # Start service
     Write-Host "Starting service..." -ForegroundColor Green
     Start-Service -Name $ServiceName
-    
+
 } else {
     Write-Host "Service not found. Installing..." -ForegroundColor Green
-    
+
     # Copy binary
     Copy-Item "$ShareFolder\$BinaryName" $ExePath -Force
-    
+
     # Create service
     sc.exe create $ServiceName binPath= "$ExePath" DisplayName= "$ServiceDisplayName" start= auto
     sc.exe description $ServiceName "$ServiceDescription"
-    
+
     # Start service
     Write-Host "Starting service..." -ForegroundColor Green
     sc.exe start $ServiceName

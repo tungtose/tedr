@@ -1,4 +1,3 @@
-$ServiceName = "MyRustService"
 $ShareFolder = "$env:USERPROFILE\Desktop\shares"
 $BinaryName = "tservice.exe"
 
