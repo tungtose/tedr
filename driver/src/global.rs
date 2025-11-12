@@ -1,7 +1,7 @@
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use wdk_sys::{HANDLE, PFLT_FILTER, PFLT_PORT, _FLT_FILTER, _FLT_PORT};
+use wdk_sys::{_FLT_FILTER, _FLT_PORT, HANDLE, PETHREAD, PFLT_FILTER, PFLT_PORT};
 
 pub struct FltGlobalState {
     filter_handle: AtomicPtr<_FLT_FILTER>,
@@ -36,7 +36,7 @@ pub fn set_client_port(port: PFLT_PORT) {
     GLOBAL_STATE.client_port.store(port, Ordering::Release);
 }
 
-pub fn set_thread_worker_handle(handle: HANDLE) {
+pub fn set_thread_worker_handle(handle: PETHREAD) {
     GLOBAL_STATE
         .thread_worker_handle
         .store(handle as *mut _, Ordering::Release);
@@ -45,29 +45,17 @@ pub fn set_thread_worker_handle(handle: HANDLE) {
 // Getters
 pub fn get_filter_handle() -> Option<PFLT_FILTER> {
     let ptr = GLOBAL_STATE.filter_handle.load(Ordering::Acquire);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(ptr)
-    }
+    if ptr.is_null() { None } else { Some(ptr) }
 }
 
 pub fn get_filter_port() -> Option<PFLT_PORT> {
     let ptr = GLOBAL_STATE.filter_port.load(Ordering::Acquire);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(ptr)
-    }
+    if ptr.is_null() { None } else { Some(ptr) }
 }
 
 pub fn get_client_port() -> Option<PFLT_PORT> {
     let ptr = GLOBAL_STATE.client_port.load(Ordering::Acquire);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(ptr)
-    }
+    if ptr.is_null() { None } else { Some(ptr) }
 }
 
 pub fn get_thread_worker_handle() -> Option<HANDLE> {

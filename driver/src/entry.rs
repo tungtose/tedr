@@ -1,20 +1,26 @@
 use core::ptr;
 
 use wdk::println;
+
 use wdk_sys::{
+    _KWAIT_REASON::Executive,
+    _MODE::KernelMode,
+    DRIVER_OBJECT, FLT_FILESYSTEM_TYPE, FLT_INSTANCE_QUERY_TEARDOWN_FLAGS,
+    FLT_INSTANCE_SETUP_FLAGS, FLT_INSTANCE_TEARDOWN_FLAGS, FLT_PORT_ALL_ACCESS, FLT_REGISTRATION,
+    FLT_REGISTRATION_VERSION, HANDLE, LARGE_INTEGER, NT_SUCCESS, NTSTATUS, OBJ_CASE_INSENSITIVE,
+    OBJ_KERNEL_HANDLE, OBJECT_ATTRIBUTES, PCFLT_RELATED_OBJECTS, PCLIENT_ID, PCUNICODE_STRING,
+    PETHREAD, PFLT_FILTER, PFLT_PORT, PSECURITY_DESCRIPTOR, PVOID, STATUS_FAIL_CHECK,
+    STATUS_SUCCESS, THREAD_ALL_ACCESS, ULONG, UNICODE_STRING, USHORT,
     filesystem::{
-        FltBuildDefaultSecurityDescriptor, FltCreateCommunicationPort, FltFreeSecurityDescriptor,
-        FltRegisterFilter, FltSendMessage, FltStartFiltering, FltUnregisterFilter,
+        FltBuildDefaultSecurityDescriptor, FltCloseClientPort, FltCloseCommunicationPort,
+        FltCreateCommunicationPort, FltFreeSecurityDescriptor, FltRegisterFilter, FltSendMessage,
+        FltStartFiltering, FltUnregisterFilter,
     },
     ntddk::{
-        DbgPrint, KeDelayExecutionThread, PsCreateSystemThread, RtlInitUnicodeString,
-        RtlSetDaclSecurityDescriptor,
+        DbgPrint, KeDelayExecutionThread, KeWaitForSingleObject, ObReferenceObjectByHandle,
+        ObfDereferenceObject, PsCreateSystemThread, RtlInitUnicodeString,
+        RtlSetDaclSecurityDescriptor, ZwClose,
     },
-    DRIVER_OBJECT, FLT_PORT_ALL_ACCESS, FLT_REGISTRATION, FLT_REGISTRATION_VERSION, HANDLE,
-    LARGE_INTEGER, NTSTATUS, NT_SUCCESS, OBJECT_ATTRIBUTES, OBJ_CASE_INSENSITIVE,
-    OBJ_KERNEL_HANDLE, PCLIENT_ID, PCUNICODE_STRING, PFLT_FILTER, PFLT_PORT, PSECURITY_DESCRIPTOR,
-    PVOID, STATUS_FAIL_CHECK, STATUS_SUCCESS, THREAD_ALL_ACCESS, UNICODE_STRING, USHORT,
-    _MODE::KernelMode,
 };
 
 use alloc::{ffi::CString, slice, string::String, vec::Vec};
@@ -60,6 +66,10 @@ pub unsafe extern "system" fn driver_entry(
     flt_registration.Version = FLT_REGISTRATION_VERSION as USHORT; // Version
     flt_registration.Flags = 0;
     flt_registration.FilterUnloadCallback = Some(filter_unload_callback);
+    flt_registration.InstanceSetupCallback = Some(instance_setup);
+    flt_registration.InstanceQueryTeardownCallback = Some(instance_query_teardown);
+    flt_registration.InstanceTeardownStartCallback = Some(instance_teardown_start);
+    flt_registration.InstanceTeardownCompleteCallback = Some(instance_teardown_complete);
 
     let mut global_filter_handle: PFLT_FILTER = unsafe { core::mem::zeroed() };
 
@@ -71,10 +81,10 @@ pub unsafe extern "system" fn driver_entry(
     if NT_SUCCESS(status) {
         println!("Register minifilter success!");
         unsafe {
+            status = FltStartFiltering(global_filter_handle);
+
             global::set_filter_handle(global_filter_handle);
             println!("Saved minifilter handle");
-
-            status = FltStartFiltering(global_filter_handle);
 
             if !NT_SUCCESS(status) {
                 println!("Failed to start minifilter");
@@ -122,11 +132,33 @@ pub unsafe extern "system" fn driver_entry(
             );
 
             if !NT_SUCCESS(status) {
-                println!("ERROR: Failed to spawning kernel thread: PsCreateSystemThread, status: {status}");
+                println!(
+                    "ERROR: Failed to spawning kernel thread: PsCreateSystemThread, status: {status}"
+                );
             } else {
-                global::set_thread_worker_handle(p_thread_handle);
-                // TODO: use ObReferenceObjectByHandle to a pointer to thread object.
-                // So we can implement properly shutdown whith ObDereferenceObject
+                let mut thread_object: PETHREAD = ptr::null_mut();
+
+                println!("Create Kernel Thread success");
+
+                let obj_status = ObReferenceObjectByHandle(
+                    p_thread_handle,
+                    THREAD_ALL_ACCESS,
+                    ptr::null_mut(),
+                    KernelMode as i8,
+                    &mut thread_object as *mut _ as *mut PVOID,
+                    ptr::null_mut(),
+                );
+
+                println!("ObReferenceObjectByHandle status: {obj_status}");
+
+                if NT_SUCCESS(obj_status) {
+                    global::set_thread_worker_handle(thread_object);
+                    println!("Setted thread handle");
+                }
+
+                status = ZwClose(p_thread_handle);
+
+                println!("ZwClose status: {status}");
             }
         }
     }
@@ -139,6 +171,44 @@ pub unsafe extern "system" fn driver_entry(
     // support).
 
     STATUS_SUCCESS
+}
+
+// ====== INSTANCES CALL BACK =========
+unsafe extern "C" fn instance_setup(
+    _flt_object: PCFLT_RELATED_OBJECTS,
+    _flags: FLT_INSTANCE_SETUP_FLAGS,
+    _volume_device_type: ULONG,
+    _volume_file_system_type: FLT_FILESYSTEM_TYPE,
+) -> NTSTATUS {
+    println!("[Instance] Setup");
+
+    // TODO
+
+    STATUS_SUCCESS
+}
+
+unsafe extern "C" fn instance_query_teardown(
+    _flt_object: PCFLT_RELATED_OBJECTS,
+    _flag: FLT_INSTANCE_QUERY_TEARDOWN_FLAGS,
+) -> NTSTATUS {
+    println!("[Instance] Query teardown");
+
+    // TODO
+    STATUS_SUCCESS
+}
+
+unsafe extern "C" fn instance_teardown_start(
+    _flt_object: PCFLT_RELATED_OBJECTS,
+    _reason: FLT_INSTANCE_TEARDOWN_FLAGS,
+) {
+    println!("[Instance] Teardown start");
+}
+
+unsafe extern "C" fn instance_teardown_complete(
+    _flt_object: PCFLT_RELATED_OBJECTS,
+    _reason: FLT_INSTANCE_TEARDOWN_FLAGS,
+) {
+    println!("[Instance] Teardown complete");
 }
 
 unsafe extern "C" fn init_comm() -> NTSTATUS {
@@ -193,13 +263,13 @@ unsafe extern "C" fn init_comm() -> NTSTATUS {
 
     println!("[COM] Dbg 5");
 
-    let m_port: PFLT_PORT = ptr::null_mut();
+    let mut m_port: PFLT_PORT = ptr::null_mut();
 
     unsafe {
         if let Some(filter_handle) = global::get_filter_handle() {
             status = FltCreateCommunicationPort(
                 filter_handle,
-                m_port as _,
+                &mut m_port,
                 &mut obj_attr,
                 ptr::null_mut(),
                 Some(connect_notify),
@@ -208,7 +278,7 @@ unsafe extern "C" fn init_comm() -> NTSTATUS {
                 1,
             );
 
-            println!("[COM] Dbg 6");
+            println!("[COM] FltCreateCommunicationPort status: {status}");
 
             global::set_filter_port(m_port);
 
@@ -255,6 +325,7 @@ unsafe extern "C" fn disconnect_notify(_connection_cookie: PVOID) {
 }
 
 unsafe extern "C" fn filter_unload_callback(_flags: u32) -> NTSTATUS {
+    println!("[Unload Filter] Called");
     STATUS_SUCCESS
 }
 
@@ -289,11 +360,6 @@ unsafe extern "C" fn worker_thread(_context: PVOID) {
             continue;
         }
 
-        // if unsafe { GLOBAL_CLIENT_PORT.is_none() } {
-        //     println!("[Worker] client not connected skip");
-        //     continue;
-        // }
-
         // Send "Hello world" message
         let message = b"Hello world\0";
 
@@ -309,37 +375,89 @@ unsafe extern "C" fn worker_thread(_context: PVOID) {
         // );
 
         println!("[Worker] Sending Hello World");
-        if let Some(filter_handle) = global::get_filter_handle() {
-            if let Some(mut client_port) = global::get_client_port() {
-                let status = unsafe {
-                    FltSendMessage(
-                        filter_handle,
-                        &mut client_port,
-                        message.as_ptr() as _,
-                        message.len() as u32,
-                        ptr::null_mut(),
-                        ptr::null_mut(),
-                        ptr::null_mut(),
-                    )
-                };
-
-                if NT_SUCCESS(status) {
-                    println!("[Worker] Message sent successfully");
-                } else {
-                    println!("[Worker] Failed to send message: {:#x}", status);
-                }
+        if let Some(filter_handle) = global::get_filter_handle()
+            && let Some(mut client_port) = global::get_client_port()
+        {
+            let status = unsafe {
+                FltSendMessage(
+                    filter_handle,
+                    &mut client_port,
+                    message.as_ptr() as _,
+                    message.len() as u32,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
             };
-        }
 
-        // TODO: properly exit
+            if NT_SUCCESS(status) {
+                println!("[Worker] Message sent successfully");
+            } else {
+                println!("[Worker] Failed to send message: {:#x}", status);
+            }
+        }
     }
 }
 
-extern "C" fn driver_exit(_driver: *mut DRIVER_OBJECT) {
-    if let Some(filter_handle) = global::get_filter_handle() {
-        unsafe { FltUnregisterFilter(filter_handle) };
+pub fn stop_worker_thread() {
+    println!("[Driver] Stopping worker thread");
+
+    // Signal thread to exist
+    global::signal_worker_exit();
+
+    // Wait for the thread to finish
+    if let Some(thread_object) = global::get_thread_worker_handle() {
+        println!("[Driver] waiting for worker thread to exit");
+
+        let mut timeout = LARGE_INTEGER::default();
+        timeout.QuadPart = -10 * 10_000_000; // 10 secs
+
+        let status = unsafe {
+            KeWaitForSingleObject(
+                thread_object as PVOID,
+                Executive,
+                KernelMode as i8,
+                0,
+                &mut timeout,
+            )
+        };
+
+        if NT_SUCCESS(status) {
+            println!("[Driver] Worker thread exited successfully");
+        } else {
+            println!("[Driver] Worker thread wait returned: {:#x}", status);
+        }
+
+        // dereferences the thread objet
+        unsafe { ObfDereferenceObject(thread_object as PVOID) };
+        global::set_thread_worker_handle(ptr::null_mut());
     }
 
-    println!("Goodbye World!");
+    println!("[Driver] Worker thread cleanup complete");
+}
+
+extern "C" fn driver_exit(_driver: *mut DRIVER_OBJECT) {
+    stop_worker_thread();
+
+    if let Some(server_port) = global::get_filter_port() {
+        println!("[Driver] Server port found, closing...");
+        unsafe { FltCloseCommunicationPort(server_port) };
+        global::set_filter_port(ptr::null_mut());
+        println!("[Driver] Server port closed");
+    }
+
+    if let Some(filter_handle) = global::get_filter_handle() {
+        if let Some(mut client_port) = global::get_client_port() {
+            unsafe { FltCloseClientPort(filter_handle, &mut client_port) };
+            println!("[Driver] Closed Client Port");
+
+            global::set_client_port(ptr::null_mut());
+        }
+
+        unsafe { FltUnregisterFilter(filter_handle) };
+        println!("[Driver] Unregister Filter Done");
+        global::set_filter_handle(ptr::null_mut());
+    }
+
     println!("Driver Exit Complete!");
 }
