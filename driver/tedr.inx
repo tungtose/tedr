@@ -44,7 +44,7 @@ tedr.sys
 
 ; ================= Service installation =================
 [TedrWDMDevice.NT$ARCH$.Services]
-AddService = SampleWDMService, %SPSVCINST_ASSOCSERVICE%, Tedr_WDM_Service_Install
+AddService = tedrWDMService, %SPSVCINST_ASSOCSERVICE%, Tedr_WDM_Service_Install
 
 [Tedr_WDM_Service_Install]
 DisplayName    = %ServiceDesc%

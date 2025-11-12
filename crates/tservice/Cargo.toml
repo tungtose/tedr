@@ -1,0 +1,13 @@
+[package]
+name = "tservice"
+version = "0.0.1"
+edition.workspace = true
+
+[dependencies]
+windows-services.workspace = true
+windows.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
