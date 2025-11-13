@@ -10,7 +10,7 @@ use wdk_sys::{
     FLT_REGISTRATION_VERSION, HANDLE, LARGE_INTEGER, NT_SUCCESS, NTSTATUS, OBJ_CASE_INSENSITIVE,
     OBJ_KERNEL_HANDLE, OBJECT_ATTRIBUTES, PCFLT_RELATED_OBJECTS, PCLIENT_ID, PCUNICODE_STRING,
     PETHREAD, PFLT_FILTER, PFLT_PORT, PSECURITY_DESCRIPTOR, PVOID, STATUS_FAIL_CHECK,
-    STATUS_SUCCESS, THREAD_ALL_ACCESS, ULONG, UNICODE_STRING, USHORT,
+    STATUS_INVALID_PARAMETER, STATUS_SUCCESS, THREAD_ALL_ACCESS, ULONG, UNICODE_STRING, USHORT,
     filesystem::{
         FltBuildDefaultSecurityDescriptor, FltCloseClientPort, FltCloseCommunicationPort,
         FltCreateCommunicationPort, FltFreeSecurityDescriptor, FltRegisterFilter, FltSendMessage,
@@ -25,7 +25,7 @@ use wdk_sys::{
 
 use alloc::{ffi::CString, slice, string::String, vec::Vec};
 
-use crate::global;
+use crate::global::{self, set_client_port};
 
 /// `driver_entry` function required by WDM
 ///
@@ -61,15 +61,17 @@ pub unsafe extern "system" fn driver_entry(
 
     println!("[Entry] Init Global state");
 
-    let mut flt_registration: FLT_REGISTRATION = FLT_REGISTRATION::default();
-    flt_registration.Size = core::mem::size_of::<FLT_REGISTRATION>() as USHORT;
-    flt_registration.Version = FLT_REGISTRATION_VERSION as USHORT; // Version
-    flt_registration.Flags = 0;
-    flt_registration.FilterUnloadCallback = Some(filter_unload_callback);
-    flt_registration.InstanceSetupCallback = Some(instance_setup);
-    flt_registration.InstanceQueryTeardownCallback = Some(instance_query_teardown);
-    flt_registration.InstanceTeardownStartCallback = Some(instance_teardown_start);
-    flt_registration.InstanceTeardownCompleteCallback = Some(instance_teardown_complete);
+    let flt_registration: FLT_REGISTRATION = FLT_REGISTRATION {
+        Size: core::mem::size_of::<FLT_REGISTRATION>() as USHORT,
+        Version: FLT_REGISTRATION_VERSION as USHORT,
+        Flags: 0,
+        FilterUnloadCallback: Some(filter_unload_callback),
+        InstanceSetupCallback: Some(instance_setup),
+        InstanceQueryTeardownCallback: Some(instance_query_teardown),
+        InstanceTeardownStartCallback: Some(instance_teardown_start),
+        InstanceTeardownCompleteCallback: Some(instance_teardown_complete),
+        ..Default::default()
+    };
 
     let mut global_filter_handle: PFLT_FILTER = unsafe { core::mem::zeroed() };
 
@@ -274,7 +276,7 @@ unsafe extern "C" fn init_comm() -> NTSTATUS {
                 ptr::null_mut(),
                 Some(connect_notify),
                 Some(disconnect_notify),
-                None,
+                Some(message_notify),
                 1,
             );
 
@@ -316,12 +318,61 @@ unsafe extern "C" fn connect_notify(
     STATUS_SUCCESS
 }
 
+// pub type PFLT_MESSAGE_NOTIFY = ::core::option::Option<
+//     unsafe extern "C" fn(
+//         PortCookie: PVOID,
+//         InputBuffer: PVOID,
+//         InputBufferLength: ULONG,
+//         OutputBuffer: PVOID,
+//         OutputBufferLength: ULONG,
+//         ReturnOutputBufferLength: PULONG,
+//     ) -> NTSTATUS,
+// >;
+
+unsafe extern "C" fn message_notify(
+    _port_cookie: PVOID,
+    input_buffer: PVOID,
+    input_buffer_length: u32,
+    output_buffer: PVOID,
+    output_buffer_length: u32,
+    reply_length: *mut u32,
+) -> NTSTATUS {
+    if input_buffer.is_null() || input_buffer_length == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let input_slice = unsafe {
+        core::slice::from_raw_parts(input_buffer as *const u8, input_buffer_length as usize)
+    };
+
+    if let Ok(msg_str) = core::str::from_utf8(input_slice) {
+        println!("[Message Notify] receved from user mode: {msg_str}");
+    }
+
+    // Reply
+    if !output_buffer.is_null() && output_buffer_length > 0 {
+        let response = b"ACK from kernel";
+        let copy_len = response.len().min(output_buffer_length as usize);
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(response.as_ptr(), output_buffer as *mut u8, copy_len)
+        };
+
+        if !reply_length.is_null() {
+            unsafe {
+                *reply_length = copy_len as u32;
+            }
+        }
+    }
+
+    STATUS_SUCCESS
+}
+
 // Disconnect callback
 unsafe extern "C" fn disconnect_notify(_connection_cookie: PVOID) {
     println!("[Driver] Client disconnected");
 
-    // TODO: Clear client port
-    // unsafe { GLOBAL_CLIENT_PORT = None };
+    set_client_port(ptr::null_mut());
 }
 
 unsafe extern "C" fn filter_unload_callback(_flags: u32) -> NTSTATUS {
@@ -356,7 +407,7 @@ unsafe extern "C" fn worker_thread(_context: PVOID) {
 
         // Check if connection is connected
         if global::get_filter_handle().is_none() || global::get_client_port().is_none() {
-            println!("[Worker] client not connected skip");
+            println!("[Worker] client not connected, skip");
             continue;
         }
 
@@ -374,10 +425,14 @@ unsafe extern "C" fn worker_thread(_context: PVOID) {
         //   [in, optional]  PLARGE_INTEGER Timeout
         // );
 
-        println!("[Worker] Sending Hello World");
         if let Some(filter_handle) = global::get_filter_handle()
             && let Some(mut client_port) = global::get_client_port()
         {
+            println!("[Worker] Sending Hello World");
+
+            let mut timeout = LARGE_INTEGER::default();
+            interval.QuadPart = -10_000_000;
+
             let status = unsafe {
                 FltSendMessage(
                     filter_handle,
@@ -386,7 +441,7 @@ unsafe extern "C" fn worker_thread(_context: PVOID) {
                     message.len() as u32,
                     ptr::null_mut(),
                     ptr::null_mut(),
-                    ptr::null_mut(),
+                    &mut timeout,
                 )
             };
 

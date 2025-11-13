@@ -1,16 +1,18 @@
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use windows_services::Command;
+mod conn;
 
 fn main() {
     std::panic::set_hook(Box::new(|panic_info| {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("C:\\Services\\Tedr\\panic.log")
-            .unwrap();
+            .open("C:\\logs\\panic.log")
+            .expect("Failed to open logs file");
+
         use std::io::Write;
         let mut file = file;
         writeln!(file, "PANIC: {:?}", panic_info).ok();
@@ -97,5 +99,34 @@ async fn run_service(c_token: CancellationToken) {
 async fn init_service() {
     info!("Do work....");
 
-    let _ = tokio::time::sleep(Duration::from_secs(5)).await;
+    let mut conn = conn::KernelConnection::new();
+
+    match conn.connect_kernel() {
+        Ok(_) => {
+            let _handle = conn.start_message_listener(|message| {
+                info!("Processing message...");
+                info!("Data: {:?}", &message.data[..32]);
+
+                None
+            });
+
+            let hello_msg = b"Hello from usermode";
+
+            match conn.send_message_to_kernel(hello_msg) {
+                Ok(reply) => {
+                    if let Ok(reply_str) = str::from_utf8(&reply) {
+                        info!("Kernel replied: {reply_str:?}");
+                    }
+                }
+                Err(e) => {
+                    info!("Failed to send: {:?}", e);
+                }
+            }
+        }
+        Err(err) => {
+            error!("Failed to connect to kernel: {err:?}");
+        }
+    }
+
+    let _ = tokio::signal::ctrl_c().await;
 }
