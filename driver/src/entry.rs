@@ -3,29 +3,35 @@ use core::ptr;
 use wdk::println;
 
 use wdk_sys::{
+    _FLT_PREOP_CALLBACK_STATUS::{FLT_PREOP_COMPLETE, FLT_PREOP_SUCCESS_NO_CALLBACK},
     _KWAIT_REASON::Executive,
     _MODE::KernelMode,
-    DRIVER_OBJECT, FLT_FILESYSTEM_TYPE, FLT_INSTANCE_QUERY_TEARDOWN_FLAGS,
-    FLT_INSTANCE_SETUP_FLAGS, FLT_INSTANCE_TEARDOWN_FLAGS, FLT_PORT_ALL_ACCESS, FLT_REGISTRATION,
-    FLT_REGISTRATION_VERSION, HANDLE, LARGE_INTEGER, NT_SUCCESS, NTSTATUS, OBJ_CASE_INSENSITIVE,
-    OBJ_KERNEL_HANDLE, OBJECT_ATTRIBUTES, PCFLT_RELATED_OBJECTS, PCLIENT_ID, PCUNICODE_STRING,
-    PETHREAD, PFLT_FILTER, PFLT_PORT, PSECURITY_DESCRIPTOR, PVOID, STATUS_FAIL_CHECK,
+    DRIVER_OBJECT, FILE_APPEND_DATA, FILE_DIRECTORY_FILE, FILE_REMOVABLE_MEDIA, FILE_WRITE_DATA,
+    FLT_FILE_NAME_NORMALIZED, FLT_FILE_NAME_QUERY_DEFAULT, FLT_FILESYSTEM_TYPE,
+    FLT_INSTANCE_QUERY_TEARDOWN_FLAGS, FLT_INSTANCE_SETUP_FLAGS, FLT_INSTANCE_TEARDOWN_FLAGS,
+    FLT_OPERATION_REGISTRATION, FLT_PORT_ALL_ACCESS, FLT_PREOP_CALLBACK_STATUS, FLT_REGISTRATION,
+    FLT_REGISTRATION_VERSION, HANDLE, IRP_MJ_CREATE, LARGE_INTEGER, NT_SUCCESS, NTSTATUS,
+    OBJ_CASE_INSENSITIVE, OBJ_KERNEL_HANDLE, OBJECT_ATTRIBUTES, PCFLT_RELATED_OBJECTS, PCLIENT_ID,
+    PCUNICODE_STRING, PDEVICE_OBJECT, PETHREAD, PFLT_CALLBACK_DATA, PFLT_FILE_NAME_INFORMATION,
+    PFLT_FILTER, PFLT_PORT, PSECURITY_DESCRIPTOR, PVOID, STATUS_ACCESS_DENIED, STATUS_FAIL_CHECK,
     STATUS_INVALID_PARAMETER, STATUS_SUCCESS, THREAD_ALL_ACCESS, ULONG, UNICODE_STRING, USHORT,
     filesystem::{
         FltBuildDefaultSecurityDescriptor, FltCloseClientPort, FltCloseCommunicationPort,
-        FltCreateCommunicationPort, FltFreeSecurityDescriptor, FltRegisterFilter, FltSendMessage,
-        FltStartFiltering, FltUnregisterFilter,
+        FltCreateCommunicationPort, FltFreeSecurityDescriptor, FltGetDiskDeviceObject,
+        FltGetFileNameInformation, FltGetRequestorProcessId, FltParseFileNameInformation,
+        FltRegisterFilter, FltReleaseFileNameInformation, FltSendMessage, FltStartFiltering,
+        FltUnregisterFilter,
     },
     ntddk::{
-        DbgPrint, KeDelayExecutionThread, KeWaitForSingleObject, ObReferenceObjectByHandle,
-        ObfDereferenceObject, PsCreateSystemThread, RtlInitUnicodeString,
+        KeDelayExecutionThread, KeWaitForSingleObject, ObReferenceObjectByHandle,
+        ObfDereferenceObject, PsCreateSystemThread, PsGetCurrentThreadId, RtlInitUnicodeString,
         RtlSetDaclSecurityDescriptor, ZwClose,
     },
 };
 
-use alloc::{ffi::CString, slice, string::String, vec::Vec};
+use alloc::{slice, string::String, vec::Vec};
 
-use crate::global::{self, set_client_port};
+use crate::global;
 
 /// `driver_entry` function required by WDM
 ///
@@ -41,15 +47,6 @@ pub unsafe extern "system" fn driver_entry(
     driver: &mut DRIVER_OBJECT,
     registry_path: PCUNICODE_STRING,
 ) -> NTSTATUS {
-    // This is an example of directly using DbgPrint binding to print
-    let string = CString::new("Hello World 3!\n").unwrap();
-
-    // SAFETY: This is safe because `string` is a valid pointer to a null-terminated
-    // string (`CString` guarantees null-termination)
-    unsafe {
-        DbgPrint(c"%s".as_ptr().cast(), string.as_ptr());
-    }
-
     // Translate UTF16 string to rust string
     let registry_path = String::from_utf16_lossy(unsafe {
         slice::from_raw_parts(
@@ -61,6 +58,28 @@ pub unsafe extern "system" fn driver_entry(
 
     println!("[Entry] Init Global state");
 
+    // To register these callback routines, the minifilter creates a variable-length array
+    // of FLT_OPERATION_REGISTRATION structures and stores a pointer to the array in
+    // the OperationRegistration member of the FLT_REGISTRATION structure that the minifilter
+    // passes as the Registration parameter of FltRegisterFilter. The last element of this array
+    // must be {IRP_MJ_OPERATION_END}.
+    let mut flt_operation_registration: [FLT_OPERATION_REGISTRATION; 2] = [
+        FLT_OPERATION_REGISTRATION {
+            MajorFunction: IRP_MJ_CREATE as u8,
+            Flags: 0,
+            PreOperation: Some(pre_create),
+            PostOperation: None,
+            Reserved1: ptr::null_mut(),
+        },
+        FLT_OPERATION_REGISTRATION {
+            MajorFunction: 0x80, // IRP_MJ_OPERATION_END
+            Flags: 0,
+            PreOperation: None,
+            PostOperation: None,
+            Reserved1: ptr::null_mut(),
+        },
+    ];
+
     let flt_registration: FLT_REGISTRATION = FLT_REGISTRATION {
         Size: core::mem::size_of::<FLT_REGISTRATION>() as USHORT,
         Version: FLT_REGISTRATION_VERSION as USHORT,
@@ -70,6 +89,7 @@ pub unsafe extern "system" fn driver_entry(
         InstanceQueryTeardownCallback: Some(instance_query_teardown),
         InstanceTeardownStartCallback: Some(instance_teardown_start),
         InstanceTeardownCompleteCallback: Some(instance_teardown_complete),
+        OperationRegistration: flt_operation_registration.as_mut_ptr(),
         ..Default::default()
     };
 
@@ -110,17 +130,6 @@ pub unsafe extern "system" fn driver_entry(
             }
 
             // Create worker thread: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-pscreatesystemthread
-            // NTSTATUS PsCreateSystemThread(
-            //   [out]           PHANDLE            ThreadHandle,
-            //   [in]            ULONG              DesiredAccess,
-            //   [in, optional]  POBJECT_ATTRIBUTES ObjectAttributes,
-            //   [in, optional]  HANDLE             ProcessHandle,
-            //   [out, optional] PCLIENT_ID         ClientId,
-            //   [in]            PKSTART_ROUTINE    StartRoutine,
-            //   [in, optional]  PVOID              StartContext
-            // );
-
-            // let mut obj_attr = OBJECT_ATTRIBUTES::default();
             let mut p_thread_handle: HANDLE = HANDLE::default();
 
             status = PsCreateSystemThread(
@@ -167,13 +176,110 @@ pub unsafe extern "system" fn driver_entry(
 
     driver.DriverUnload = Some(driver_exit);
 
-    // It is much better to use the println macro that has an implementation in
-    // wdk::print.rs to call DbgPrint. The println! implementation in
-    // wdk::print.rs has the same features as the one in std (ex. format args
-    // support).
-
     STATUS_SUCCESS
 }
+
+unsafe extern "C" fn pre_create(
+    data: PFLT_CALLBACK_DATA,
+    flt_object: PCFLT_RELATED_OBJECTS,
+    _completion_context: *mut PVOID,
+) -> FLT_PREOP_CALLBACK_STATUS {
+    if data.is_null() || flt_object.is_null() {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    unsafe {
+        let callback_data = &*data;
+        let objects = &*flt_object;
+
+        // Directory operation: skip
+        let create_options = (*callback_data.Iopb).Parameters.Create.Options;
+        if (create_options & FILE_DIRECTORY_FILE) != 0 {
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+
+        // Opening file: skip
+        if objects.FileObject.is_null() {
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+
+        // Check desired access from security context
+        let security_context = (*callback_data.Iopb).Parameters.Create.SecurityContext;
+        if security_context.is_null() {
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+
+        let desired_access = (*security_context).DesiredAccess;
+
+        // Only intercept write operation
+        if (desired_access & (FILE_WRITE_DATA | FILE_APPEND_DATA)) == 0 {
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+
+        let mut disk_device: PDEVICE_OBJECT = ptr::null_mut();
+        let status = FltGetDiskDeviceObject(objects.Volume, &mut disk_device);
+
+        println!("[DLP]  FltGetDiskDeviceObject status: 0x{:X}", status);
+
+        // 0x80000005 -> buffer overflow
+        if NT_SUCCESS(status) && !disk_device.is_null() {
+            let characteristics = (*disk_device).Characteristics;
+            ObfDereferenceObject(disk_device as PVOID);
+
+            println!("[DLP] Device Characteristics: 0x{:X}", characteristics);
+
+            if (characteristics & FILE_REMOVABLE_MEDIA) != 0 {
+                println!("[DLP] Copy file to USB/Removable detected!");
+                let mut name_info: PFLT_FILE_NAME_INFORMATION = ptr::null_mut();
+                let name_status = FltGetFileNameInformation(
+                    data,
+                    FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+                    &mut name_info,
+                );
+
+                if NT_SUCCESS(name_status) && !name_info.is_null() {
+                    let rs = FltParseFileNameInformation(name_info);
+
+                    println!("[DLP] FltParseFileNameInformation 0x{:X}", rs);
+
+                    let name = &(*name_info).Name;
+
+                    let name_slice =
+                        core::slice::from_raw_parts(name.Buffer, (name.Length / 2) as usize);
+
+                    let process_id = FltGetRequestorProcessId(data) as u32;
+                    let thread_id = PsGetCurrentThreadId() as usize;
+
+                    println!(
+                        "[DLP] USB write blocked: files {}, process_id {}, thread_id {}",
+                        String::from_utf16_lossy(name_slice),
+                        process_id,
+                        thread_id
+                    );
+
+                    FltReleaseFileNameInformation(name_info);
+
+                    // Block it now
+                    (*data).IoStatus.__bindgen_anon_1.Status = STATUS_ACCESS_DENIED;
+                    (*data).IoStatus.Information = 0;
+
+                    return FLT_PREOP_COMPLETE;
+                }
+            }
+        }
+    }
+
+    FLT_PREOP_SUCCESS_NO_CALLBACK
+}
+
+// unsafe extern "C" fn post_create(
+//     Data: PFLT_CALLBACK_DATA,
+//     FltObjects: PCFLT_RELATED_OBJECTS,
+//     CompletionContext: PVOID,
+//     Flags: FLT_POST_OPERATION_FLAGS,
+// ) -> FLT_POSTOP_CALLBACK_STATUS {
+//     todo!();
+// }
 
 // ====== INSTANCES CALL BACK =========
 unsafe extern "C" fn instance_setup(
@@ -372,7 +478,7 @@ unsafe extern "C" fn message_notify(
 unsafe extern "C" fn disconnect_notify(_connection_cookie: PVOID) {
     println!("[Driver] Client disconnected");
 
-    set_client_port(ptr::null_mut());
+    global::set_client_port(ptr::null_mut());
 }
 
 unsafe extern "C" fn filter_unload_callback(_flags: u32) -> NTSTATUS {
@@ -414,17 +520,6 @@ unsafe extern "C" fn worker_thread(_context: PVOID) {
         // Send "Hello world" message
         let message = b"Hello world\0";
 
-        // API: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nf-fltkernel-fltsendmessage
-        // NTSTATUS FLTAPI FltSendMessage(
-        //   [in]            PFLT_FILTER    Filter,
-        //   [in]            PFLT_PORT      *ClientPort,
-        //   [in]            PVOID          SenderBuffer,
-        //   [in]            ULONG          SenderBufferLength,
-        //   [out, optional] PVOID          ReplyBuffer,
-        //   [in, out]       PULONG         ReplyLength,
-        //   [in, optional]  PLARGE_INTEGER Timeout
-        // );
-
         if let Some(filter_handle) = global::get_filter_handle()
             && let Some(mut client_port) = global::get_client_port()
         {
@@ -433,6 +528,7 @@ unsafe extern "C" fn worker_thread(_context: PVOID) {
             let mut timeout = LARGE_INTEGER::default();
             interval.QuadPart = -10_000_000;
 
+            // API: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nf-fltkernel-fltsendmessage
             let status = unsafe {
                 FltSendMessage(
                     filter_handle,
